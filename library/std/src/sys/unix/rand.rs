@@ -194,7 +194,7 @@ mod imp {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "watchos"))]
 mod imp {
     use crate::io;
     use crate::sys::weak::weak;
@@ -218,6 +218,49 @@ mod imp {
             .unwrap_or(false)
     }
 
+    #[cfg(target_os = "macos")]
+    fn fallback_fill_bytes(v: &mut [u8]) -> Result<(), io::Error> {
+        super::read_urandom(v)
+    }
+
+    // On iOS and MacOS `SecRandomCopyBytes` calls `CCRandomCopyBytes` with
+    // `kCCRandomDefault`. `CCRandomCopyBytes` manages a CSPRNG which is seeded
+    // from `/dev/random` and which runs on its own thread accessed via GCD.
+    //
+    // This is very heavyweight compared to the alternatives, but they may not be usable:
+    // - `getentropy` was added in iOS 10, but we support a minimum of iOS 7
+    // - `/dev/urandom` is not accessible inside the iOS app sandbox.
+    //
+    // Therefore `SecRandomCopyBytes` is only used on older iOS versions where no
+    // better options are present.
+    #[cfg(target_os = "ios")]
+    fn fallback_fill_bytes(v: &mut [u8]) -> Result<(), io::Error> {
+        use crate::ptr;
+        use libc::{c_int, size_t};
+
+        enum SecRandom {}
+
+        #[allow(non_upper_case_globals)]
+        const kSecRandomDefault: *const SecRandom = ptr::null();
+
+        extern "C" {
+            fn SecRandomCopyBytes(rnd: *const SecRandom, count: size_t, bytes: *mut u8) -> c_int;
+        }
+
+        let ret = unsafe { SecRandomCopyBytes(kSecRandomDefault, v.len(), v.as_mut_ptr()) };
+        if ret == -1 {
+            panic!("couldn't generate random bytes: {}", io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    // All supported versions of watchOS (>= 5) have support for `getentropy`.
+    #[cfg(target_os = "watchos")]
+    #[cold]
+    fn fallback_fill_bytes() -> Result<(), io::Error> {
+        unreachable!()
+    }
+
     pub fn fill_bytes(v: &mut [u8], _require_secure: bool) -> Result<(), io::Error> {
         if getentropy_fill_bytes(v) {
             return Ok(());
@@ -225,7 +268,12 @@ mod imp {
 
         // Older macOS versions (< 10.12) don't support `getentropy`. Fallback to
         // reading from `/dev/urandom` on these systems.
-        super::read_urandom(v)
+        //
+        // Older iOS versions (< 10) don't support it either. Fallback to
+        // `SecRandomCopyBytes` on these systems. This is unreachable on
+        // watchOS because the minimum supported version is 5 while support
+        // was added in 3.
+        fallback_fill_bytes(v)
     }
 }
 
@@ -250,39 +298,6 @@ fn read_urandom(v: &mut [u8]) -> Result<(), crate::io::Error> {
     // If /dev/urandom is accessible, we assume that it will always work.
     file.read_exact(v).expect("failed to read /dev/urandom");
     Ok(())
-}
-
-// On iOS and MacOS `SecRandomCopyBytes` calls `CCRandomCopyBytes` with
-// `kCCRandomDefault`. `CCRandomCopyBytes` manages a CSPRNG which is seeded
-// from `/dev/random` and which runs on its own thread accessed via GCD.
-//
-// This is very heavyweight compared to the alternatives, but they aren't usable here:
-// - `getentropy` was added in iOS 10, but we support a minimum of iOS 7
-// - `/dev/urandom` is not accessible inside the iOS app sandbox.
-//
-// Therefore `SecRandomCopyBytes` is only used on iOS where there aren't better options.
-#[cfg(any(target_os = "ios", target_os = "watchos"))]
-mod imp {
-    use crate::io;
-    use crate::ptr;
-    use libc::{c_int, size_t};
-
-    enum SecRandom {}
-
-    #[allow(non_upper_case_globals)]
-    const kSecRandomDefault: *const SecRandom = ptr::null();
-
-    extern "C" {
-        fn SecRandomCopyBytes(rnd: *const SecRandom, count: size_t, bytes: *mut u8) -> c_int;
-    }
-
-    pub fn fill_bytes(v: &mut [u8], _require_secure: bool) -> Result<(), io::Error> {
-        let ret = unsafe { SecRandomCopyBytes(kSecRandomDefault, v.len(), v.as_mut_ptr()) };
-        if ret == -1 {
-            panic!("couldn't generate random bytes: {}", io::Error::last_os_error());
-        }
-        Ok(())
-    }
 }
 
 #[cfg(target_os = "openbsd")]
