@@ -3,8 +3,6 @@
 use crate::ffi::CStr;
 use crate::io::ErrorKind;
 
-pub use self::rand::hashmap_random_keys;
-
 #[cfg(not(target_os = "espidf"))]
 #[macro_use]
 pub mod weak;
