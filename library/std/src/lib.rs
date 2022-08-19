@@ -508,6 +508,8 @@ pub mod os;
 pub mod panic;
 pub mod path;
 pub mod process;
+#[unstable(feature = "stdrandom", issue = "none")]
+pub mod random;
 pub mod sync;
 pub mod time;
 
