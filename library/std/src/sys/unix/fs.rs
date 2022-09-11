@@ -11,7 +11,10 @@ use crate::sync::Arc;
 use crate::sys::fd::FileDesc;
 use crate::sys::time::SystemTime;
 use crate::sys::{cvt, cvt_r};
-use crate::sys_common::{AsInner, AsInnerMut, FromInner, IntoInner};
+use crate::sys_common::{
+    fs::{CopyInnerFrom, CopyInnerResult, CopyInnerTo},
+    AsInner, AsInnerMut, FromInner, IntoInner,
+};
 
 #[cfg(any(
     all(target_os = "linux", target_env = "gnu"),
@@ -1198,68 +1201,6 @@ impl FromRawFd for File {
 
 impl fmt::Debug for File {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        #[cfg(any(target_os = "linux", target_os = "netbsd"))]
-        fn get_path(fd: c_int) -> Option<PathBuf> {
-            let mut p = PathBuf::from("/proc/self/fd");
-            p.push(&fd.to_string());
-            readlink(&p).ok()
-        }
-
-        #[cfg(target_os = "macos")]
-        fn get_path(fd: c_int) -> Option<PathBuf> {
-            // FIXME: The use of PATH_MAX is generally not encouraged, but it
-            // is inevitable in this case because macOS defines `fcntl` with
-            // `F_GETPATH` in terms of `MAXPATHLEN`, and there are no
-            // alternatives. If a better method is invented, it should be used
-            // instead.
-            let mut buf = vec![0; libc::PATH_MAX as usize];
-            let n = unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_ptr()) };
-            if n == -1 {
-                return None;
-            }
-            let l = buf.iter().position(|&c| c == 0).unwrap();
-            buf.truncate(l as usize);
-            buf.shrink_to_fit();
-            Some(PathBuf::from(OsString::from_vec(buf)))
-        }
-
-        #[cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
-        fn get_path(fd: c_int) -> Option<PathBuf> {
-            let info = Box::<libc::kinfo_file>::new_zeroed();
-            let mut info = unsafe { info.assume_init() };
-            info.kf_structsize = mem::size_of::<libc::kinfo_file>() as libc::c_int;
-            let n = unsafe { libc::fcntl(fd, libc::F_KINFO, &mut *info) };
-            if n == -1 {
-                return None;
-            }
-            let buf = unsafe { CStr::from_ptr(info.kf_path.as_mut_ptr()).to_bytes().to_vec() };
-            Some(PathBuf::from(OsString::from_vec(buf)))
-        }
-
-        #[cfg(target_os = "vxworks")]
-        fn get_path(fd: c_int) -> Option<PathBuf> {
-            let mut buf = vec![0; libc::PATH_MAX as usize];
-            let n = unsafe { libc::ioctl(fd, libc::FIOGETNAME, buf.as_ptr()) };
-            if n == -1 {
-                return None;
-            }
-            let l = buf.iter().position(|&c| c == 0).unwrap();
-            buf.truncate(l as usize);
-            Some(PathBuf::from(OsString::from_vec(buf)))
-        }
-
-        #[cfg(not(any(
-            target_os = "linux",
-            target_os = "macos",
-            target_os = "vxworks",
-            all(target_os = "freebsd", target_arch = "x86_64"),
-            target_os = "netbsd"
-        )))]
-        fn get_path(_fd: c_int) -> Option<PathBuf> {
-            // FIXME(#24570): implement this for other Unix platforms
-            None
-        }
-
         #[cfg(any(target_os = "linux", target_os = "macos", target_os = "vxworks"))]
         fn get_mode(fd: c_int) -> Option<(bool, bool)> {
             let mode = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -1291,6 +1232,77 @@ impl fmt::Debug for File {
         }
         b.finish()
     }
+}
+
+pub(crate) fn get_path(fd: c_int) -> Option<PathBuf> {
+    #[cfg(any(target_os = "linux", target_os = "netbsd"))]
+    #[inline(always)]
+    fn get_path(fd: c_int) -> Option<PathBuf> {
+        let mut p = PathBuf::from("/proc/self/fd");
+        p.push(&fd.to_string());
+        readlink(&p).ok()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[inline(always)]
+    fn get_path(fd: c_int) -> Option<PathBuf> {
+        // FIXME: The use of PATH_MAX is generally not encouraged, but it
+        // is inevitable in this case because macOS defines `fcntl` with
+        // `F_GETPATH` in terms of `MAXPATHLEN`, and there are no
+        // alternatives. If a better method is invented, it should be used
+        // instead.
+        let mut buf = vec![0; libc::PATH_MAX as usize];
+        let n = unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_ptr()) };
+        if n == -1 {
+            return None;
+        }
+        let l = buf.iter().position(|&c| c == 0).unwrap();
+        buf.truncate(l as usize);
+        buf.shrink_to_fit();
+        Some(PathBuf::from(OsString::from_vec(buf)))
+    }
+
+    #[cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
+    #[inline(always)]
+    fn get_path(fd: c_int) -> Option<PathBuf> {
+        let info = Box::<libc::kinfo_file>::new_zeroed();
+        let mut info = unsafe { info.assume_init() };
+        info.kf_structsize = mem::size_of::<libc::kinfo_file>() as libc::c_int;
+        let n = unsafe { libc::fcntl(fd, libc::F_KINFO, &mut *info) };
+        if n == -1 {
+            return None;
+        }
+        let buf = unsafe { CStr::from_ptr(info.kf_path.as_mut_ptr()).to_bytes().to_vec() };
+        Some(PathBuf::from(OsString::from_vec(buf)))
+    }
+
+    #[cfg(target_os = "vxworks")]
+    #[inline(always)]
+    fn get_path(fd: c_int) -> Option<PathBuf> {
+        let mut buf = vec![0; libc::PATH_MAX as usize];
+        let n = unsafe { libc::ioctl(fd, libc::FIOGETNAME, buf.as_ptr()) };
+        if n == -1 {
+            return None;
+        }
+        let l = buf.iter().position(|&c| c == 0).unwrap();
+        buf.truncate(l as usize);
+        Some(PathBuf::from(OsString::from_vec(buf)))
+    }
+
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "vxworks",
+        all(target_os = "freebsd", target_arch = "x86_64"),
+        target_os = "netbsd"
+    )))]
+    #[inline(always)]
+    fn get_path(_fd: c_int) -> Option<PathBuf> {
+        // FIXME(#24570): implement this for other Unix platforms
+        None
+    }
+
+    get_path(fd)
 }
 
 pub fn readdir(p: &Path) -> io::Result<ReadDir> {
@@ -1522,22 +1534,62 @@ pub fn copy(from: &Path, to: &Path) -> io::Result<u64> {
     let (mut reader, reader_metadata) = open_from(from)?;
     let (mut writer, _) = open_to_and_set_permissions(to, reader_metadata)?;
 
-    io::copy(&mut reader, &mut writer)
+    match copy_inner(CopyInnerFrom::File(&mut reader), CopyInnerTo::File(&mut writer)) {
+        Ok(CopyInnerResult::Ok(read)) => Ok(read),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "watchos",
+)))]
+pub(crate) fn copy_inner(
+    reader: CopyInnerFrom<'_>,
+    to: CopyInnerTo<'_>,
+) -> io::Result<CopyInnerResult> {
+    debug_assert!(matches!(to, CopyInnerTo::File(_)));
+    debug_assert!(matches!(reader, CopyInnerFrom::File(_)));
+    match to {
+        CopyInnerTo::File(dest) => io::copy(reader, dest).map(CopyInnerResult::Ok),
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn copy(from: &Path, to: &Path) -> io::Result<u64> {
     let (mut reader, reader_metadata) = open_from(from)?;
-    let max_len = u64::MAX;
     let (mut writer, _) = open_to_and_set_permissions(to, reader_metadata)?;
 
-    use super::kernel_copy::{copy_regular_files, CopyResult};
+    match copy_inner(CopyInnerFrom::File(&mut reader), CopyInnerTo::File(&mut writer)) {
+        Ok(CopyInnerResult::Ok(read)) => Ok(read),
+        Err(e) => Err(e),
+    }
+}
 
-    match copy_regular_files(reader.as_raw_fd(), writer.as_raw_fd(), max_len) {
-        CopyResult::Ended(bytes) => Ok(bytes),
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn copy_inner(
+    reader: CopyInnerFrom<'_>,
+    to: CopyInnerTo<'_>,
+) -> io::Result<CopyInnerResult> {
+    use super::kernel_copy::{copy_regular_files, CopyResult};
+    const MAX_LEN: u64 = u64::MAX;
+
+    let reader = match reader {
+        CopyInnerFrom::File(src) => src,
+    };
+
+    let writer = match to {
+        CopyInnerTo::File(dest) => dest,
+    };
+
+    match copy_regular_files(reader.as_raw_fd(), writer.as_raw_fd(), MAX_LEN) {
+        CopyResult::Ended(bytes) => Ok(CopyInnerResult::Ok(bytes)),
         CopyResult::Error(e, _) => Err(e),
         CopyResult::Fallback(written) => match io::copy::generic_copy(&mut reader, &mut writer) {
-            Ok(bytes) => Ok(bytes + written),
+            Ok(bytes) => Ok(CopyInnerResult::Ok(bytes + written)),
             Err(e) => Err(e),
         },
     }
@@ -1545,7 +1597,24 @@ pub fn copy(from: &Path, to: &Path) -> io::Result<u64> {
 
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "watchos"))]
 pub fn copy(from: &Path, to: &Path) -> io::Result<u64> {
-    use crate::sync::atomic::{AtomicBool, Ordering};
+    match copy_inner(CopyInnerFrom::Path(from), CopyInnerTo::Path(to)) {
+        // SAFETY: An existing path is always used and no `File -> Path` conversion is
+        // attempted.
+        Ok(CopyInnerResult::PathUnsupported) => unsafe { core::hint::unreachable_unchecked() },
+        Ok(CopyInnerResult::Ok(r)) => Ok(r),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "watchos"))]
+pub(crate) fn copy_inner(
+    reader: CopyInnerFrom<'_>,
+    to: CopyInnerTo<'_>,
+) -> io::Result<CopyInnerResult> {
+    use crate::{
+        borrow::Cow,
+        sync::atomic::{AtomicBool, Ordering},
+    };
 
     const COPYFILE_ACL: u32 = 1 << 0;
     const COPYFILE_STAT: u32 = 1 << 1;
@@ -1604,16 +1673,35 @@ pub fn copy(from: &Path, to: &Path) -> io::Result<u64> {
         ) -> libc::c_int
     }
 
-    let (reader, reader_metadata) = open_from(from)?;
+    let to = match to {
+        CopyInnerTo::Path(p) => Cow::Borrowed(p),
+        CopyInnerTo::File(file) => match get_path(file.as_raw_fd()) {
+            None => return Ok(CopyInnerResult::PathUnsupported),
+            Some(p) => Cow::Owned(p),
+        },
+    };
+
+    let _owned_file;
+    let (reader, reader_metadata) = match reader {
+        CopyInnerFrom::Path(p) => {
+            let (reader, reader_metadata) = open_from(p)?;
+            _owned_file = reader;
+            (&_owned_file, reader_metadata)
+        }
+        CopyInnerFrom::File(file) => {
+            let metadata = file.metadata()?;
+            (&*file, metadata)
+        }
+    };
 
     // Opportunistically attempt to create a copy-on-write clone of `from`
     // using `fclonefileat`.
     if HAS_FCLONEFILEAT.load(Ordering::Relaxed) {
-        let to = cstr(to)?;
+        let to = cstr(&to)?;
         let clonefile_result =
             cvt(unsafe { fclonefileat(reader.as_raw_fd(), libc::AT_FDCWD, to.as_ptr(), 0) });
         match clonefile_result {
-            Ok(_) => return Ok(reader_metadata.len()),
+            Ok(_) => return Ok(CopyInnerResult::Ok(reader_metadata.len())),
             Err(err) => match err.raw_os_error() {
                 // `fclonefileat` will fail on non-APFS volumes, if the
                 // destination already exists, or if the source and destination
@@ -1627,7 +1715,7 @@ pub fn copy(from: &Path, to: &Path) -> io::Result<u64> {
     }
 
     // Fall back to using `fcopyfile` if `fclonefileat` does not succeed.
-    let (writer, writer_metadata) = open_to_and_set_permissions(to, reader_metadata)?;
+    let (writer, writer_metadata) = open_to_and_set_permissions(&to, reader_metadata)?;
 
     // We ensure that `FreeOnDrop` never contains a null pointer so it is
     // always safe to call `copyfile_state_free`
@@ -1651,7 +1739,7 @@ pub fn copy(from: &Path, to: &Path) -> io::Result<u64> {
             &mut bytes_copied as *mut libc::off_t as *mut libc::c_void,
         )
     })?;
-    Ok(bytes_copied as u64)
+    Ok(CopyInnerResult::Ok(bytes_copied as u64))
 }
 
 pub fn chown(path: &Path, uid: u32, gid: u32) -> io::Result<()> {

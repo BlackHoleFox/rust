@@ -49,3 +49,23 @@ pub fn try_exists(path: &Path) -> io::Result<bool> {
         Err(error) => Err(error),
     }
 }
+
+// XXX: Only Apple and Windows platforms have APIs that use file paths instead of solely file descriptors.
+
+pub(crate) enum CopyInnerTo<'a> {
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "watchos", windows))]
+    Path(&'a Path),
+    File(&'a mut crate::fs::File),
+}
+
+pub(crate) enum CopyInnerFrom<'a> {
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "watchos", windows))]
+    Path(&'a Path),
+    File(&'a mut crate::fs::File),
+}
+
+pub(crate) enum CopyInnerResult {
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "watchos", windows))]
+    PathUnsupported,
+    Ok(u64),
+}

@@ -12,7 +12,10 @@ use crate::sync::Arc;
 use crate::sys::handle::Handle;
 use crate::sys::time::SystemTime;
 use crate::sys::{c, cvt, Align8};
-use crate::sys_common::{AsInner, FromInner, IntoInner};
+use crate::sys_common::{
+    fs::{CopyInnerFrom, CopyInnerResult, CopyInnerTo},
+    AsInner, FromInner, IntoInner,
+};
 use crate::thread;
 
 use super::path::maybe_verbatim;
@@ -1312,6 +1315,19 @@ pub fn canonicalize(p: &Path) -> io::Result<PathBuf> {
 }
 
 pub fn copy(from: &Path, to: &Path) -> io::Result<u64> {
+    match copy_inner(CopyInnerFrom::Path(from), CopyInnerTo::Path(to)) {
+        Ok(CopyInnerResult::Ok(read)) => Ok(read),
+        // SAFETY: An existing path is always used and no `File -> Path` conversion is
+        // attempted.
+        Ok(CopyInnerResult::PathUnsupported) => unsafe { core::hint::unreachable_unchecked() },
+        Err(e) => Err(e),
+    }
+}
+
+pub(crate) fn copy_inner(
+    reader: CopyInnerFrom<'_>,
+    to: CopyInnerTo<'_>,
+) -> io::Result<CopyInnerResult> {
     unsafe extern "system" fn callback(
         _TotalFileSize: c::LARGE_INTEGER,
         _TotalBytesTransferred: c::LARGE_INTEGER,
@@ -1328,8 +1344,30 @@ pub fn copy(from: &Path, to: &Path) -> io::Result<u64> {
         }
         c::PROGRESS_CONTINUE
     }
-    let pfrom = maybe_verbatim(from)?;
-    let pto = maybe_verbatim(to)?;
+
+    let pto = match to {
+        CopyInnerTo::Path(p) => maybe_verbatim(p)?,
+        CopyInnerTo::File(file) => match get_path(file.as_inner()) {
+            Ok(p) => {
+                let path = maybe_verbatim(&p)?;
+                // NB: We `fsync` the src file descriptor before copying anything so that
+                // if users write to a `File` before copying it, the most recent changes
+                // are obviously ready. See `std::io::copy::copy_to` for this case.
+                file.sync_all()?;
+                path
+            }
+            Err(_) => return Ok(CopyInnerResult::PathUnsupported),
+        },
+    };
+
+    let pfrom = match reader {
+        CopyInnerFrom::Path(p) => maybe_verbatim(p)?,
+        CopyInnerFrom::File(file) => match get_path(file.as_inner()) {
+            Ok(p) => maybe_verbatim(&p)?,
+            Err(_) => return Ok(CopyInnerResult::PathUnsupported),
+        },
+    };
+
     let mut size = 0i64;
     cvt(unsafe {
         c::CopyFileExW(
@@ -1341,7 +1379,7 @@ pub fn copy(from: &Path, to: &Path) -> io::Result<u64> {
             0,
         )
     })?;
-    Ok(size as u64)
+    Ok(CopyInnerResult::Ok(size as u64))
 }
 
 #[allow(dead_code)]

@@ -46,6 +46,9 @@ use crate::mem::MaybeUninit;
 /// `sendfile(2)` or `splice(2)` syscalls to move data directly between file
 /// descriptors if possible.
 ///
+/// On other platforms, this will try to use the most efficent OS syscalls to move data
+/// directly between file descriptors if possible.
+///
 /// Note that platform-specific behavior [may change in the future][changes].
 ///
 /// [changes]: crate::io#platform-specific-behavior
@@ -55,11 +58,129 @@ where
     R: Read,
     W: Write,
 {
+    let copier = Copier { reader, writer };
+    CopySpec::copy_to(copier)
+}
+
+/// Specializations for a more efficent implementation of copying bytes when the
+/// source and destination are file descriptors.
+trait CopySpec {
+    fn copy_to(self) -> Result<u64>;
+}
+
+fn default_copy<R: Read + ?Sized, W: Write + ?Sized>(
+    reader: &mut R,
+    writer: &mut W,
+) -> Result<u64> {
     cfg_if::cfg_if! {
         if #[cfg(any(target_os = "linux", target_os = "android"))] {
             crate::sys::kernel_copy::copy_spec(reader, writer)
         } else {
             generic_copy(reader, writer)
+        }
+    }
+}
+
+struct Copier<'a, R: Read + ?Sized, W: Write + ?Sized> {
+    reader: &'a mut R,
+    writer: &'a mut W,
+}
+
+impl<R: Read + ?Sized, W: Write + ?Sized> CopySpec for Copier<'_, R, W> {
+    default fn copy_to(mut self) -> Result<u64> {
+        default_copy(&mut self.reader, &mut self.writer)
+    }
+}
+
+/// Optimizations for copying a file to another under reasonable conditions
+///
+/// This only happens on UNIX and Windows because they have optimized APIs for
+/// the operation.
+#[cfg(any(unix, windows))]
+mod file_copy {
+    use super::{default_copy, Copier, CopySpec};
+    use crate::fs::File;
+    use crate::io::{Read, Result, Seek, SeekFrom, Write};
+    use crate::sys_common::fs::{CopyInnerFrom, CopyInnerResult, CopyInnerTo};
+
+    #[rustc_specialization_trait]
+    trait CopyRead: Read {
+        fn params(&mut self) -> &mut File;
+    }
+
+    #[rustc_specialization_trait]
+    trait CopyWrite: Write {
+        fn params(&mut self) -> &mut File;
+    }
+
+    // A main goal of this implementation is to avoid any "weird" behavior
+    // when using `io::copy` on files that you wouldn't see with the default
+    // read/write loop.
+    //
+    // Things such as:
+    // - Copy offets
+    // - Destination truncation
+    // - Stream positions
+    // - Including other writes to the file descriptor (ie; &mut io::Write) in the
+    // copy operation.
+    impl<R: CopyRead, W: CopyWrite> CopySpec for Copier<'_, R, W> {
+        fn copy_to(mut self) -> Result<u64> {
+            let reader = self.reader.params();
+            let writer = self.writer.params();
+
+            // If both the file handles aren't in the default state, then
+            // we fallback so that the behavior matches `io::copy` in leaving/respecting
+            // the file/stream position. The OS copy functions don't do this, which would
+            // be a behavioral difference.
+            if reader.stream_position()? != 0 || writer.stream_position()? != 0 {
+                return default_copy(reader, writer);
+            }
+
+            // On Windows and macOS, the file copy functions don't work in
+            // ranges and will result in truncating the destination if the source
+            // is larger. Linux does this correctly, but consistency > narrowness for now.
+            if writer.metadata()?.len() != 0 {
+                return default_copy(reader, writer);
+            }
+
+            // NB: macOS and Windows perform a `File -> Path` mapping operation and write
+            // through the path, not the file descriptor. This is generally discouraged due
+            // to edge cases but the additional guards help prevent them.
+            //
+            // macOS's file copy uses a source file descriptor, so it doesn't suffer from the issue
+            // (only the destination is passed as a path, which is fine) but on Windows the source
+            // is referred to by path too. To avoid missing data that is not associated with the open handle
+            // when copying, the Windows implementation will call `fsync` if `copy_inner`'s source is a file.
+            //
+            // NB: `copy_inner` will utilize the Linux kernel's fast copying for files.
+            match crate::sys::fs::copy_inner(CopyInnerFrom::File(reader), CopyInnerTo::File(writer))
+            {
+                Ok(CopyInnerResult::Ok(r)) => {
+                    // Match the behavior of `io::copy` and set the stream positions
+                    // for the source and destination to how many bytes were copied.
+                    reader.seek(SeekFrom::Start(r))?;
+                    writer.seek(SeekFrom::Start(r))?;
+
+                    Ok(r)
+                }
+                #[cfg(any(target_os = "macos", target_os = "ios", target_os = "watchos", windows))]
+                Ok(CopyInnerResult::PathUnsupported) => {
+                    default_copy(&mut self.reader, &mut self.writer)
+                }
+                Err(e) => Err(e),
+            }
+        }
+    }
+
+    impl CopyRead for File {
+        fn params(&mut self) -> &mut File {
+            self
+        }
+    }
+
+    impl CopyWrite for File {
+        fn params(&mut self) -> &mut File {
+            self
         }
     }
 }
